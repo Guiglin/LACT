@@ -175,7 +175,7 @@ impl AsyncComponent for AppModel {
             .expect("Could not list devices");
 
         if system_info.version != GUI_VERSION || system_info.commit.as_deref() != Some(GIT_COMMIT) {
-            let err = anyhow!("Version mismatch between GUI and daemon ({GUI_VERSION}-{GIT_COMMIT} vs {}-{})! If you have updated LACT, you need to restart the service with `sudo systemctl restart lactd`.", system_info.version, system_info.commit.as_deref().unwrap_or_default());
+            let err = anyhow!("Version mismatch between GUI and daemon ({GUI_VERSION}-{GIT_COMMIT} vs {}-{})! If you have updated LACT, you need to restart the service with `doas dinitctl restart lactd`.", system_info.version, system_info.commit.as_deref().unwrap_or_default());
             sender.input(AppMsg::Error(err.into()));
         }
 
@@ -894,7 +894,7 @@ fn show_embedded_info(parent: &ApplicationWindow, err: anyhow::Error) {
 
     let text_label = gtk::Label::new(Some(&text));
     let enable_label = gtk::Entry::builder()
-        .text("sudo systemctl enable --now lactd")
+        .text("doas dinitctl enable lactd")
         .editable(false)
         .build();
 
