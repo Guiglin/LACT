@@ -101,15 +101,32 @@ pub enum ConfirmCommand {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-pub enum SetClocksCommand {
-    MaxCoreClock(i32),
-    MaxMemoryClock(i32),
-    MaxVoltage(i32),
-    MinCoreClock(i32),
-    MinMemoryClock(i32),
-    MinVoltage(i32),
-    VoltageOffset(i32),
+pub struct SetClocksCommand {
+    pub r#type: ClockspeedType,
+    pub value: Option<i32>,
+}
+
+impl SetClocksCommand {
+    pub fn reset() -> Self {
+        Self {
+            r#type: ClockspeedType::Reset,
+            value: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockspeedType {
+    MaxCoreClock,
+    MaxMemoryClock,
+    MaxVoltage,
+    MinCoreClock,
+    MinMemoryClock,
+    MinVoltage,
+    VoltageOffset,
+    GpuClockOffset(u32),
+    MemClockOffset(u32),
     Reset,
 }
 
@@ -129,5 +146,28 @@ impl fmt::Display for ProfileBase {
             ProfileBase::Profile(name) => name,
         };
         text.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        request::{ClockspeedType, SetClocksCommand},
+        Request,
+    };
+
+    #[test]
+    fn deserialize_requests() {
+        assert_eq!(
+            Request::SetClocksValue {
+                id: "asd",
+                command: SetClocksCommand {
+                    r#type: ClockspeedType::MaxCoreClock,
+                    value: Some(2000)
+                }
+            },
+            serde_json::from_str(r#"{"command": "set_clocks_value", "args": {"id": "asd", "command": {"type": "max_core_clock", "value": 2000}}}"#)
+                .unwrap()
+        );
     }
 }

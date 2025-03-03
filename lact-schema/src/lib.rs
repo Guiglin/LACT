@@ -103,6 +103,15 @@ pub struct DeviceInfo {
     pub drm_info: Option<DrmInfo>,
 }
 
+impl DeviceInfo {
+    pub fn vram_clock_ratio(&self) -> f64 {
+        self.drm_info
+            .as_ref()
+            .map(|info| info.vram_clock_ratio)
+            .unwrap_or(1.0)
+    }
+}
+
 #[skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct DrmInfo {
@@ -158,11 +167,12 @@ pub enum ClocksTable {
     Intel(IntelClocksTable),
 }
 
-#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct NvidiaClocksTable {
-    pub gpc: Option<NvidiaClockInfo>,
-    pub mem: Option<NvidiaClockInfo>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub gpu_offsets: IndexMap<u32, NvidiaClockOffset>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub mem_offsets: IndexMap<u32, NvidiaClockOffset>,
 }
 
 /// Doc from `xe_gt_freq.c`
@@ -179,11 +189,10 @@ pub struct IntelClocksTable {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
-pub struct NvidiaClockInfo {
+pub struct NvidiaClockOffset {
+    pub current: i32,
+    pub min: i32,
     pub max: i32,
-    pub offset: i32,
-    pub offset_ratio: i32,
-    pub offset_range: (i32, i32),
 }
 
 impl From<AmdClocksTableGen> for ClocksInfo {

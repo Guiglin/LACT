@@ -21,8 +21,8 @@ use lact_schema::{
     ClocksInfo, ClockspeedStats, DeviceInfo, DeviceStats, DrmInfo, FanStats, IntelDrmInfo,
     LinkInfo, PmfwInfo, PowerState, PowerStates, PowerStats, VoltageStats, VramStats,
 };
-use libdrm_amdgpu_sys::LibDrmAmdgpu;
 use libdrm_amdgpu_sys::AMDGPU::{ThrottleStatus, ThrottlerBit};
+use libdrm_amdgpu_sys::{LibDrmAmdgpu, AMDGPU::SENSOR_INFO::SENSOR_TYPE};
 use std::{
     cell::RefCell,
     cmp,
@@ -45,6 +45,7 @@ use {
 };
 
 const GPU_CLOCKDOWN_TIMEOUT_SECS: u64 = 3;
+const FAN_CONTROL_RETRIES: u32 = 10;
 const MAX_PSTATE_READ_ATTEMPTS: u32 = 5;
 const STEAM_DECK_IDS: [&str; 2] = ["163F", "1435"];
 
@@ -67,14 +68,12 @@ impl AmdGpuController {
         #[allow(unused_mut)]
         let mut drm_handle = None;
         #[cfg(not(test))]
-        if matches!(handle.get_driver(), "amdgpu" | "radeon") && libdrm_amdgpu.is_some() {
-            match get_drm_handle(&handle, libdrm_amdgpu.as_ref().unwrap()) {
-                Ok(handle) => {
-                    drm_handle = Some(handle);
-                }
-                Err(err) => {
-                    warn!("Could not get DRM handle: {err}");
-                }
+        if let Some(libdrm_amdgpu) = libdrm_amdgpu {
+            if handle.get_driver() == "amdgpu" {
+                drm_handle = Some(
+                    get_drm_handle(&handle, libdrm_amdgpu)
+                        .context("Could not get AMD DRM handle")?,
+                );
             }
         }
 
@@ -203,7 +202,19 @@ impl AmdGpuController {
             1 => {
                 warn!("GPU has only one temperature sensor, 'temperature_key' setting will be ignored");
             }
-            _ => (),
+            _ => {
+                if !temps.contains_key(&settings.temperature_key) {
+                    return Err(anyhow!(
+                        "Sensor with name {} not found, available sensors: {}",
+                        settings.temperature_key,
+                        temps
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<&str>>()
+                            .join(",")
+                    ));
+                }
+            }
         }
 
         hw_mon
@@ -232,6 +243,8 @@ impl AmdGpuController {
             #[allow(clippy::cast_precision_loss)]
             let change_threshold = settings.change_threshold.unwrap_or(0) as f32;
 
+            let mut retries = 0;
+
             loop {
                 select! {
                     () = sleep(interval) => (),
@@ -241,11 +254,19 @@ impl AmdGpuController {
                 let mut temps = hw_mon.get_temps();
                 let temp = if temps.len() == 1 {
                     temps.into_values().next().unwrap()
+                } else if let Some(value) = temps.remove(&temp_key) {
+                    value
                 } else {
-                    temps
-                        .remove(&temp_key)
-                        .expect("Could not get temperature by given key")
+                    retries += 1;
+
+                    if retries == FAN_CONTROL_RETRIES {
+                        error!("could not get temperature sensor {temp_key}, exiting fan control (reached max attempts)");
+                        break;
+                    }
+                    error!("could not get temperature sensor {temp_key} from {} sensors (assuming error is temporary, attempt {retries}/{FAN_CONTROL_RETRIES})", temps.len());
+                    continue;
                 };
+                retries = 0;
 
                 let current_temp = temp.current.expect("Missing temp");
 
@@ -375,6 +396,21 @@ impl AmdGpuController {
             .hw_monitors
             .first()
             .context("GPU has no hardware monitor")
+    }
+
+    fn get_clockspeed(&self) -> ClockspeedStats {
+        let vram_clockspeed = self
+            .drm_handle
+            .as_ref()
+            .and_then(|handle| handle.sensor_info(SENSOR_TYPE::GFX_MCLK).ok())
+            .map(u64::from)
+            .or_else(|| self.hw_mon_and_then(HwMon::get_vram_clockspeed));
+
+        ClockspeedStats {
+            gpu_clockspeed: self.hw_mon_and_then(HwMon::get_gpu_clockspeed),
+            current_gfxclk: self.get_current_gfxclk(),
+            vram_clockspeed,
+        }
     }
 
     fn get_current_gfxclk(&self) -> Option<u64> {
@@ -563,11 +599,7 @@ impl GpuController for AmdGpuController {
                     zero_rpm_temperature: self.handle.get_fan_zero_rpm_stop_temperature().ok(),
                 },
             },
-            clockspeed: ClockspeedStats {
-                gpu_clockspeed: self.hw_mon_and_then(HwMon::get_gpu_clockspeed),
-                current_gfxclk: self.get_current_gfxclk(),
-                vram_clockspeed: self.hw_mon_and_then(HwMon::get_vram_clockspeed),
-            },
+            clockspeed: self.get_clockspeed(),
             voltage: VoltageStats {
                 gpu: self.hw_mon_and_then(HwMon::get_gpu_voltage),
                 northbridge: self.hw_mon_and_then(HwMon::get_northbridge_voltage),
@@ -988,10 +1020,7 @@ impl ClocksConfiguration {
             // Avoid writing settings to the clocks table except the user-specified ones
             // There is an issue on some GPU models where the default values are actually outside of the allowed range
             // See https://github.com/sibradzic/amdgpu-clocks/issues/32#issuecomment-829953519 (part 2) for an example
-
-            if table.vddc_curve.is_empty() {
-                table.clear();
-            }
+            table.clear();
 
             // Normalize the VDDC curve - make sure all of the values are within the allowed range
             table.normalize_vddc_curve();

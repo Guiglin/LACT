@@ -25,7 +25,6 @@ use header::{
     profile_rule_window::ProfileRuleWindowMsg, Header, HeaderMsg, PROFILE_RULE_WINDOW_BROKER,
 };
 use lact_client::{ConnectionStatusMsg, DaemonClient};
-use lact_daemon::MODULE_CONF_PATH;
 use lact_schema::{
     args::GuiArgs,
     request::{ConfirmCommand, SetClocksCommand},
@@ -33,8 +32,11 @@ use lact_schema::{
 };
 use msg::AppMsg;
 use pages::{
-    info_page::InformationPage, oc_page::OcPage, software_page::SoftwarePage,
-    thermals_page::ThermalsPage, PageUpdate,
+    info_page::InformationPage,
+    oc_page::{OcPage, OcPageMsg},
+    software_page::SoftwarePage,
+    thermals_page::ThermalsPage,
+    PageUpdate,
 };
 use relm4::{
     actions::{RelmAction, RelmActionGroup},
@@ -62,7 +64,7 @@ pub struct AppModel {
     graphs_window: relm4::Controller<GraphsWindow>,
 
     info_page: relm4::Controller<InformationPage>,
-    oc_page: OcPage,
+    oc_page: relm4::Controller<OcPage>,
     thermals_page: ThermalsPage,
     software_page: relm4::Controller<SoftwarePage>,
 
@@ -81,34 +83,34 @@ impl AsyncComponent for AppModel {
 
     view! {
         #[root]
-        gtk::ApplicationWindow {
-            set_title: Some("LACT"),
-            set_default_width: 600,
-            set_default_height: 900,
-            set_icon_name: Some(APP_ID),
-            set_titlebar: Some(model.header.widget()),
+        gtk::ApplicationWindow::builder()
+            .titlebar(&gtk::HeaderBar::new())
+            .default_height(900)
+            .default_width(60)
+            .icon_name(APP_ID)
+            .title("LACT")
+            .build() {
+                #[name = "root_box"]
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 5,
 
-            #[name = "root_box"]
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 5,
+                    #[name = "root_stack"]
+                    gtk::Stack {
+                        set_vexpand: true,
+                        set_margin_top: 15,
+                        set_margin_start: 30,
+                        set_margin_end: 30,
 
-                #[name = "root_stack"]
-                gtk::Stack {
-                    set_vexpand: true,
-                    set_margin_top: 15,
-                    set_margin_start: 30,
-                    set_margin_end: 30,
+                        add_titled[Some("info_page"), "Information"] = model.info_page.widget(),
+                        add_titled[Some("oc_page"), "OC"] = model.oc_page.widget(),
+                        add_titled[Some("thermals_page"), "Thermals"] = &model.thermals_page.container.clone(),
+                        add_titled[Some("software_page"), "Software"] = model.software_page.widget(),
+                    },
 
-                    add_titled[Some("info_page"), "Information"] = model.info_page.widget(),
-                    add_titled[Some("oc_page"), "OC"] = &model.oc_page.container.clone(),
-                    add_titled[Some("thermals_page"), "Thermals"] = &model.thermals_page.container.clone(),
-                    add_titled[Some("software_page"), "Software"] = model.software_page.widget(),
-                },
-
-                model.apply_revealer.widget(),
-            }
-        },
+                    model.apply_revealer.widget(),
+                }
+            },
 
         #[name = "reconnecting_dialog"]
         gtk::MessageDialog::new(
@@ -165,6 +167,7 @@ impl AsyncComponent for AppModel {
             .get_system_info()
             .await
             .expect("Could not fetch system info");
+        let system_info = Rc::new(system_info);
 
         let devices = daemon_client
             .list_devices()
@@ -178,7 +181,9 @@ impl AsyncComponent for AppModel {
 
         let info_page = InformationPage::builder().launch(()).detach();
 
-        let oc_page = OcPage::new(&system_info);
+        let oc_page = OcPage::builder()
+            .launch(system_info.clone())
+            .forward(sender.input_sender(), |msg| msg);
         let thermals_page = ThermalsPage::new(&system_info);
 
         let software_page = SoftwarePage::builder()
@@ -186,6 +191,13 @@ impl AsyncComponent for AppModel {
             .detach();
 
         let header = Header::builder()
+            .update_root(|headerbar| {
+                *headerbar = root
+                    .titlebar()
+                    .unwrap()
+                    .downcast::<gtk::HeaderBar>()
+                    .unwrap();
+            })
             .launch(devices)
             .forward(sender.input_sender(), |msg| msg);
 
@@ -193,13 +205,6 @@ impl AsyncComponent for AppModel {
             .launch(())
             .forward(sender.input_sender(), |msg| msg);
 
-        oc_page.clocks_frame.connect_clocks_reset(clone!(
-            #[strong]
-            sender,
-            move || {
-                sender.input(AppMsg::ResetClocks);
-            }
-        ));
         thermals_page.connect_reset_pmfw(clone!(
             #[strong]
             sender,
@@ -207,21 +212,6 @@ impl AsyncComponent for AppModel {
                 sender.input(AppMsg::ResetPmfw);
             }
         ));
-
-        if let Some(ref button) = oc_page.enable_overclocking_button {
-            button.connect_clicked(clone!(
-                #[strong]
-                sender,
-                move |_| {
-                    sender.input(AppMsg::ask_confirmation(
-                        AppMsg::EnableOverdrive,
-                        "Enable Overclocking",
-                        format!("This will enable the overdrive feature of the amdgpu driver by creating a file at <b>{MODULE_CONF_PATH}</b> and updating the initramfs. Are you sure you want to do this?"),
-                        gtk::ButtonsType::OkCancel,
-                    ));
-                }
-            ));
-        }
 
         let graphs_window = GraphsWindow::builder().launch(()).detach();
 
@@ -281,6 +271,9 @@ impl AppModel {
     ) -> Result<(), Arc<anyhow::Error>> {
         match msg {
             AppMsg::Error(err) => return Err(err),
+            AppMsg::SettingsChanged => {
+                self.apply_revealer.emit(ApplyRevealerMsg::Show);
+            }
             AppMsg::ReloadProfiles { include_state } => {
                 self.reload_profiles(include_state).await?;
                 sender.input(AppMsg::ReloadData { full: false });
@@ -329,10 +322,14 @@ impl AppModel {
                 });
             }
             AppMsg::Stats(stats) => {
-                self.info_page.emit(PageUpdate::Stats(stats.clone()));
+                let update = PageUpdate::Stats(stats.clone());
+                self.info_page.emit(update.clone());
+                self.oc_page.emit(OcPageMsg::Update {
+                    update,
+                    initial: false,
+                });
 
                 self.thermals_page.set_stats(&stats, false);
-                self.oc_page.set_stats(&stats, false);
 
                 self.graphs_window.emit(GraphsWindowMsg::Stats(stats));
             }
@@ -349,7 +346,7 @@ impl AppModel {
             AppMsg::ResetClocks => {
                 let gpu_id = self.current_gpu_id()?;
                 self.daemon_client
-                    .set_clocks_value(&gpu_id, SetClocksCommand::Reset)
+                    .set_clocks_value(&gpu_id, SetClocksCommand::reset())
                     .await?;
                 self.daemon_client
                     .confirm_pending_config(ConfirmCommand::Confirm)
@@ -454,9 +451,12 @@ impl AppModel {
             sender.input(AppMsg::Error(Arc::new(anyhow!("Nvidia driver detected, but the management library could not be loaded. Check lact service status for more information."))));
         }
 
-        self.info_page.emit(PageUpdate::Info(info.clone()));
-
-        self.oc_page.set_info(&info);
+        let update = PageUpdate::Info(info.clone());
+        self.info_page.emit(update.clone());
+        self.oc_page.emit(OcPageMsg::Update {
+            update,
+            initial: true,
+        });
 
         let vram_clock_ratio = info
             .drm_info
@@ -493,10 +493,14 @@ impl AppModel {
             .context("Could not fetch stats")?;
         let stats = Arc::new(stats);
 
-        self.oc_page.set_stats(&stats, true);
         self.thermals_page.set_stats(&stats, true);
 
-        self.info_page.emit(PageUpdate::Stats(stats));
+        let update = PageUpdate::Stats(stats.clone());
+        self.info_page.emit(update.clone());
+        self.oc_page.emit(OcPageMsg::Update {
+            update,
+            initial: true,
+        });
 
         let maybe_clocks_table = match self.daemon_client.get_device_clocks_info(&gpu_id).await {
             Ok(info) => info.table,
@@ -505,7 +509,8 @@ impl AppModel {
                 None
             }
         };
-        self.oc_page.set_clocks_table(maybe_clocks_table);
+        self.oc_page
+            .emit(OcPageMsg::ClocksTable(maybe_clocks_table));
 
         let maybe_modes_table = match self
             .daemon_client
@@ -519,14 +524,11 @@ impl AppModel {
             }
         };
         self.oc_page
-            .performance_frame
-            .set_power_profile_modes(maybe_modes_table);
+            .emit(OcPageMsg::ProfileModesTable(maybe_modes_table));
 
         match self.daemon_client.get_power_states(&gpu_id).await {
             Ok(power_states) => {
-                self.oc_page
-                    .power_states_frame
-                    .set_power_states(power_states);
+                self.oc_page.emit(OcPageMsg::PowerStates(power_states));
             }
             Err(err) => warn!("could not get power states: {err:?}"),
         }
@@ -543,8 +545,6 @@ impl AppModel {
 
         self.thermals_page
             .connect_settings_changed(show_revealer.clone());
-
-        self.oc_page.connect_settings_changed(show_revealer);
 
         self.apply_revealer
             .sender()
@@ -571,7 +571,8 @@ impl AppModel {
 
         debug!("applying settings on gpu {gpu_id}");
 
-        if let Some(cap) = self.oc_page.get_power_cap() {
+        let cap = self.oc_page.model().get_power_cap();
+        if let Some(cap) = cap {
             self.daemon_client
                 .set_power_cap(&gpu_id, Some(cap))
                 .await
@@ -593,7 +594,8 @@ impl AppModel {
             .await
             .context("Could not commit config")?;
 
-        if let Some(level) = self.oc_page.get_performance_level() {
+        let performance_level = self.oc_page.model().get_performance_level();
+        if let Some(level) = performance_level {
             self.daemon_client
                 .set_performance_level(&gpu_id, level)
                 .await
@@ -605,10 +607,12 @@ impl AppModel {
 
             let mode_index = self
                 .oc_page
+                .model()
                 .performance_frame
                 .get_selected_power_profile_mode();
             let custom_heuristics = self
                 .oc_page
+                .model()
                 .performance_frame
                 .get_power_profile_mode_custom_heuristics();
 
@@ -645,24 +649,22 @@ impl AppModel {
                 .context("Could not commit config")?;
         }
 
-        let clocks_commands = self.oc_page.clocks_frame.get_commands();
+        let clocks_commands = self.oc_page.model().get_clocks_commands();
 
         debug!("applying clocks commands {clocks_commands:#?}");
 
-        let enabled_power_states = self.oc_page.get_enabled_power_states();
+        let enabled_power_states = self.oc_page.model().get_enabled_power_states();
 
         for (kind, states) in enabled_power_states {
-            if !states.is_empty() {
-                self.daemon_client
-                    .set_enabled_power_states(&gpu_id, kind, states)
-                    .await
-                    .context("Could not set power states")?;
+            self.daemon_client
+                .set_enabled_power_states(&gpu_id, kind, states)
+                .await
+                .context("Could not set power states")?;
 
-                self.daemon_client
-                    .confirm_pending_config(ConfirmCommand::Confirm)
-                    .await
-                    .context("Could not commit config")?;
-            }
+            self.daemon_client
+                .confirm_pending_config(ConfirmCommand::Confirm)
+                .await
+                .context("Could not commit config")?;
         }
 
         if !clocks_commands.is_empty() {
